@@ -2,46 +2,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-
 #include <mpi.h>
-//======================
 #include <errno.h>
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/types.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <sys/eventfd.h>
-#include <sys/mman.h>
-#include <sys/select.h>
-#include <semaphore.h> //<--
 #include <limits.h>
-//======================
-unsigned char dummy = 0;
+#include <uuid/uuid.h>
+#include <pthread.h>
 
-
-typedef struct meta_data{
-    
-    int magic;
-    sem_t meta_semaphore;
-    char hostname[65];
-    long memSize;
-    long bitmapOffset;
-    long numOfFrames;
-    long frameSize;
-    long metaSize; //Byte
-}meta_data_t;
-
+int TestAndSet(unsigned char volatile*);
 
 int main(int argc, char **argv)
 {
-	int i;
 	int num_ranks;
-	int remote_rank, my_rank;
-	int length;
-	int round;
-	double timer = 0;
+	int my_rank;
+	int fd;
+	void * map_region;
+
 
 	MPI_Status status;
 
@@ -50,20 +29,7 @@ int main(int argc, char **argv)
 	MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &num_ranks);
 
-	if(num_ranks != 2) {
-		if(my_rank == 0) 
-			fprintf(stderr, "Meta_test needs exactly two UEs; try again\n");
-		exit(-1);
-	}
-
-	remote_rank = (my_rank + 1) % 2;
-
-	printf("Rank: %d; PID: %d\n", my_rank, getpid());
-
-int fd;
-void * map_region;
-
-	printf("[readMetadata] locking on file /dev/uio0\n");
+	printf("Rank %d opening device file /dev/uio0\n",my_rank);
 
 	if ((fd=open("/dev/uio0", O_RDWR)) < 0){
 		fprintf(stderr, "ERROR: cannot open file\n");
@@ -72,118 +38,75 @@ void * map_region;
 
 	if ((map_region=mmap(NULL, 20000, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 1*getpagesize()))<0){
 		fprintf(stderr, "ERROR: cannot mmap file\n");
-	} else {
-		printf("[readMetadata] mapped to %p\n", map_region);
+		goto error_out;
+	} 
+
+	//##### Metadata Variables
+	unsigned char volatile *first_byte = map_region;
+	pthread_spinlock_t * volatile spinlock = map_region + sizeof(char);
+	uuid_t* volatile uuid = map_region + sizeof(char) + sizeof(pthread_spinlock_t);
+	char uuid_str[37];
+	//#####
+
+	/* 
+	 * Memory layout
+	 * =============
+	 * first_byte
+	 * spinlock
+	 * uuid
+	 * ...
+	 *
+	 */
+
+	//printf("Value before __syinc_bool_compare_and_swap = %d\nand default ret value=%d\n",*p,ret);
+
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	if (uuid_is_null(*uuid) && TestAndSet(first_byte)){
+          pthread_spin_init(spinlock, PTHREAD_PROCESS_SHARED);
+	  uuid_generate(*uuid);
+	  uuid_unparse_lower(*uuid, uuid_str);
+	  sleep(1);
+	  printf("\n\n##### critical section #####\nI am the very first! My rank is %d.\nGenerated uuid: %s\n############################\n\n",my_rank,uuid_str);
 	}
 
-sleep(2);
+	//printf("Value after __sync_bool_compare_and_swap = %d\nand new ret value=%d\n",*p,ret);
 
-int a=0;
-int b=1;
-int c=2;
+	sleep(2);
 
+	MPI_Barrier(MPI_COMM_WORLD);
 
-if(my_rank == 0){
-printf("Test...\n");
-    volatile meta_data_t *metadata = (volatile meta_data_t*) map_region;
+	pthread_spin_lock(spinlock);
+       	  (*first_byte)++;
+    	  uuid_unparse_lower(*uuid, uuid_str);
+    	  printf("The first byte is char=%d\tMy rank is %d.\texisting uuid: %s\n",(int)*first_byte,my_rank,uuid_str);
+    	  usleep(250000); // helps to keep the output in order
+	pthread_spin_unlock(spinlock);
 
-    printf("Metadata:\n");
-    printf("  -magic = %d\n", metadata->magic);
-    printf("  -hostname = %s\n", metadata->hostname);
-    printf("  -memSize = %lu\n", metadata->memSize);
-    printf("  -bitmapOffset = %d\n", metadata->bitmapOffset);
-    printf("  -numOfFrames = %d\n", metadata->numOfFrames);
-    printf("  -frameSize = %d\n", metadata->frameSize);
-    printf("  -metaSize = %d\n", metadata->metaSize);
+	MPI_Barrier(MPI_COMM_WORLD);
+	if(my_rank==0) printf("Programm exited normally\n");
+	usleep(250000);
+	MPI_Finalize();
+	memset(map_region, 0, 100 );  // clean device memory
+	munmap(map_region,20000); 	
+        close(fd);
+	
+	
+	return 0;
+
+error_out:
+	fprintf(stderr, "An error ouccurred unexpectedly - job aborted!\n");
+	return -1;
+
 }
 
 
+int TestAndSet(unsigned char volatile* p){
+/*
+ * This function provides atomic test-and-set
+ */
 
+	return  __sync_bool_compare_and_swap(p,0,1);
 
-
-
-
-//	sleep(10);
-
-
-//	if(my_rank == 0) 
-//		printf("#bytes\t\tusec\t\tMB/sec\n");
-
-/*	if(my_rank == 0) {
-		for(length=1; length <= maxlen; length*=2) {
-
-
-			// synchronize before starting PING-PONG: 
-			MPI_Barrier(MPI_COMM_WORLD);
-
-			for(round=0; round<numrounds+WARM_UP; round++) {
-
-
-				// send PING: 
-				MPI_Ssend(send_buffer, 
-				    	  length, 
-					  MPI_CHAR, 
-					  remote_rank, 
-					  0, 
-					  MPI_COMM_WORLD);
-
-				// recv PONG:
-				MPI_Recv(recv_buffer, 
-				    	 length, 
-					 MPI_CHAR, 
-					 remote_rank, 
-					 0, 
-					 MPI_COMM_WORLD, 
-					 &status);
-
-				// start timer:
-				if (round == WARM_UP-1)
-					timer = MPI_Wtime();
-
-			}
-
-			// stop timer:
-			timer = MPI_Wtime() - timer;
-
-			printf("%d\t\t%1.2lf\t\t%1.2lf\n", 
-			       length, 
-			       timer/(2.0*numrounds)*1000000, 
-			       (length/(timer/(2.0*numrounds)))/(1024*1024));
-			fflush(stdout);
-		}
-	} else {
-		for(length=1; length <= maxlen; length*=2) {
-
-			// synchronize before starting PING-PONG:
-			MPI_Barrier(MPI_COMM_WORLD);
-
-			for(round=0; round<numrounds+WARM_UP; round++) {
-
-
-				// recv PING:
-				MPI_Recv(recv_buffer, 
-				    	 length, 
-					 MPI_CHAR, 
-					 remote_rank, 
-					 0, 
-					 MPI_COMM_WORLD, 
-					 &status);
-
-				//  send PONG:
-				MPI_Ssend(send_buffer, 
-				    	  length, 
-					  MPI_CHAR, 
-					  remote_rank, 
-					  0, 
-					  MPI_COMM_WORLD);
-
-			}
-		}
-	}
-
-*/
-	MPI_Finalize();
-
-	return 0;
 }
 
